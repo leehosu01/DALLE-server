@@ -13,7 +13,9 @@ from einops import repeat
 from flask import Flask, jsonify, request
 from PIL import Image
 import tqdm
-
+import requests
+import os
+import math
 
 app = Flask(__name__)
 
@@ -23,9 +25,16 @@ CHECK_INTERVAL = 0.1
 
 # load model
 device = "cuda"
-clip_model, clip_preprocess = clip.load("ViT-B/32", device)
+clip_device = "cpu"
+clip_model, clip_preprocess = clip.load("ViT-B/32", clip_device)
 
 vae = VQGanVAE(None, None)
+
+if not os.path.exists("16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt"):
+    # https://github.com/robvanvolt/DALLE-models/tree/main/models/taming_transformer/16L_64HD_8H_512I_128T_cc12m_cc3m_3E
+    model_url = "https://www.dropbox.com/s/8mmgnromwoilpfm/16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt?dl=1"
+    r = requests.get(model_url, allow_redirects=True)
+    open('16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt', 'wb').write(r.content)
 
 load_obj = torch.load(
     "./16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt"
@@ -53,64 +62,52 @@ image_size = vae.image_size
 
 def handle_requests_by_batch():
     while True:
-        request_batch = []
+        requests = requests_queue.get()
+        try:
+            requests["output"] = make_images(
+                requests["input"][0], requests["input"][1]
+            )
 
-        while not (len(request_batch) >= REQUEST_BATCH_SIZE):
-            try:
-                request_batch.append(requests_queue.get(timeout=CHECK_INTERVAL))
-            except Empty:
-                continue
-
-            for requests in request_batch:
-                try:
-                    requests["output"] = make_images(
-                        requests["input"][0], requests["input"][1]
-                    )
-
-                except Exception as e:
-                    requests["output"] = e
+        except Exception as e:
+            requests["output"] = e
 
 
 handler = Thread(target=handle_requests_by_batch).start()
 
-
+@torch.no_grad()
 def make_images(text_input, num_images):
     try:
         require_samples = samples_for_one * num_images
-
         text = tokenizer.tokenize([text_input], dalle.text_seq_len).to(device)
         text_chunk = repeat(text, "() n -> b n", b=batch_size)
 
         outputs = []
         for step_index in tqdm.trange(
-            require_samples / batch_size, desc=f"generating images for - {text}"
+            math.ceil(require_samples / batch_size), desc=f"generating images for - {text_input}"
         ):
             output = dalle.generate_images(text_chunk, filter_thres=top_k)
-            outputs.append(output)
-        outputs = torch.cat(outputs)
+            outputs.append(np.transpose(output.cpu().numpy()*255, (0, 2, 3, 1)).astype('uint8'))
+        outputs = np.concatenate(outputs)
 
-        clip_image_inputs = clip_preprocess(outputs).to(device)
-        clip_text_inputs = clip.tokenize([text_input]).to(device)
-
+        clip_image_inputs = torch.stack([clip_preprocess(Image.fromarray(I)) for I in outputs]).to(clip_device)
+        clip_text_inputs = clip.tokenize([text_input]).to(clip_device)
+        
         image_features = clip_model.encode_image(clip_image_inputs)
         text_features = clip_model.encode_text(clip_text_inputs)
-
+        
         image_features /= image_features.norm(dim=-1, keepdim=True)  # [B, C]
         text_features /= text_features.norm(dim=-1, keepdim=True)  # [1, C]
 
-        score = (image_features @ text_features.t()).squeeze(-1)
-        arg_order = torch.argsort(score)
+        score = (image_features @ text_features.t()).squeeze(-1).cpu().numpy()
+        arg_order = np.argsort(score)
         outputs, score = outputs[arg_order], score[arg_order]
-
+        
         response = []
 
         for i, image in tqdm.tqdm(
-            enumerate(outputs[:num_images]), desc="saving images"
+            enumerate(outputs[-1:-num_images-1:-1]), desc="saving images"
         ):
-            np_image = np.moveaxis(image.cpu().numpy(), 0, -1)
-            formatted = (np_image * 255).astype("uint8")
-
-            img = Image.fromarray(formatted)
+            img = Image.fromarray(image)
 
             buffered = BytesIO()
             img.save(buffered, format="JPEG")
@@ -118,7 +115,7 @@ def make_images(text_input, num_images):
             response.append(img_str)
         # TODO super resolution
 
-        return (response, score)
+        return response
 
     except Exception as e:
         print("Error occur in script generating!", e)
