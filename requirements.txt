@@ -5,3 +5,4 @@ dalle-pytorch==0.14.3
 tqdm
 deepspeed==0.4.2
 triton==0.4.2
+git+https://github.com/openai/CLIP.git
