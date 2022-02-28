@@ -4,18 +4,12 @@ from io import BytesIO
 from queue import Empty, Queue
 from threading import Thread
 
-import clip
-import numpy as np
-import torch
-from dalle_pytorch import DALLE, VQGanVAE
-from dalle_pytorch.tokenizer import tokenizer
-from einops import repeat
+import ruclip
 from flask import Flask, jsonify, request
 from PIL import Image
-import tqdm
-import requests
-import os
-import math
+from rudalle import get_realesrgan, get_rudalle_model, get_tokenizer, get_vae
+from rudalle.pipelines import cherry_pick_by_ruclip, generate_images, super_resolution
+from translators import bing as translate_api
 
 app = Flask(__name__)
 
@@ -24,49 +18,27 @@ REQUEST_BATCH_SIZE = 4  # max request size.
 CHECK_INTERVAL = 0.1
 
 # load model
+batch_size = 8
 device = "cuda"
-clip_device = "cpu"
-clip_model, clip_preprocess = clip.load("ViT-B/32", clip_device)
+dalle = get_rudalle_model("Malevich", pretrained=True, fp16=True, device=device)
+realesrgan = get_realesrgan("x2", device=device)  # x2/x4/x8
+tokenizer = get_tokenizer()
+vae = get_vae(dwt=True).to(device)  # for stable generations you should use dwt=False
+clip, processor = ruclip.load("ruclip-vit-base-patch32-384", device=device)
+clip_predictor = ruclip.Predictor(clip, processor, device, bs=batch_size)
 
-vae = VQGanVAE(None, None)
+top_k = 512
+top_p = 0.995
 
-if not os.path.exists("16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt"):
-    # https://github.com/robvanvolt/DALLE-models/tree/main/models/taming_transformer/16L_64HD_8H_512I_128T_cc12m_cc3m_3E
-    model_url = "https://www.dropbox.com/s/8mmgnromwoilpfm/16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt?dl=1"
-    r = requests.get(model_url, allow_redirects=True)
-    open('16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt', 'wb').write(r.content)
 
-load_obj = torch.load(
-    "./16L_64HD_8H_512I_128T_cc12m_cc3m_3E.pt"
-)  # model checkpoint : https://github.com/robvanvolt/DALLE-models/tree/main/models/taming_transformer
-dalle_params, _, weights = (
-    load_obj.pop("hparams"),
-    load_obj.pop("vae_params"),
-    load_obj.pop("weights"),
-)
-dalle_params.pop("vae", None)  # cleanup later
-
-dalle = DALLE(vae=vae, **dalle_params).to(device)
-
-dalle.load_state_dict(weights)
-
-batch_size = 4
 samples_for_one = 16
-
-top_k = 0.9
-
-# generate images
-
-image_size = vae.image_size
 
 
 def handle_requests_by_batch():
     while True:
         requests = requests_queue.get()
         try:
-            requests["output"] = make_images(
-                requests["input"][0], requests["input"][1]
-            )
+            requests["output"] = make_images(requests["input"][0], requests["input"][1])
 
         except Exception as e:
             requests["output"] = e
@@ -74,46 +46,39 @@ def handle_requests_by_batch():
 
 handler = Thread(target=handle_requests_by_batch).start()
 
-@torch.no_grad()
+
 def make_images(text_input, num_images):
     try:
-        require_samples = samples_for_one * num_images
-        text = tokenizer.tokenize([text_input], dalle.text_seq_len).to(device)
-        text_chunk = repeat(text, "() n -> b n", b=batch_size)
+        text = translate_api(text_input, from_language="auto", to_language="ja")
+        text = translate_api(text, from_language="ja", to_language="ru")
 
-        outputs = []
-        for step_index in tqdm.trange(
-            math.ceil(require_samples / batch_size), desc=f"generating images for - {text_input}"
-        ):
-            output = dalle.generate_images(text_chunk, filter_thres=top_k)
-            outputs.append(np.transpose(output.cpu().numpy()*255, (0, 2, 3, 1)).astype('uint8'))
-        outputs = np.concatenate(outputs)
+        images_num = num_images * samples_for_one
+        pil_images, ppl_scores = generate_images(
+            text,
+            tokenizer,
+            dalle,
+            vae,
+            top_k=top_k,
+            images_num=images_num,
+            top_p=top_p,
+            bs=batch_size,
+        )
+        # CLIP
+        top_images = cherry_pick_by_ruclip(
+            pil_images, text, clip_predictor, count=num_images
+        )
+        # Super Resolution
+        sr_images = super_resolution(top_images, realesrgan)
 
-        clip_image_inputs = torch.stack([clip_preprocess(Image.fromarray(I)) for I in outputs]).to(clip_device)
-        clip_text_inputs = clip.tokenize([text_input]).to(clip_device)
-        
-        image_features = clip_model.encode_image(clip_image_inputs)
-        text_features = clip_model.encode_text(clip_text_inputs)
-        
-        image_features /= image_features.norm(dim=-1, keepdim=True)  # [B, C]
-        text_features /= text_features.norm(dim=-1, keepdim=True)  # [1, C]
-
-        score = (image_features @ text_features.t()).squeeze(-1).cpu().numpy()
-        arg_order = np.argsort(score)
-        outputs, score = outputs[arg_order], score[arg_order]
-        
         response = []
 
-        for i, image in tqdm.tqdm(
-            enumerate(outputs[-1:-num_images-1:-1]), desc="saving images"
-        ):
+        for image in sr_images:
             img = Image.fromarray(image)
 
             buffered = BytesIO()
             img.save(buffered, format="JPEG")
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
             response.append(img_str)
-        # TODO super resolution
 
         return response
 
