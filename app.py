@@ -18,7 +18,7 @@ REQUEST_BATCH_SIZE = 4  # max request size.
 CHECK_INTERVAL = 0.1
 
 # load model
-batch_size = 8
+batch_size = 10
 device = "cuda"
 dalle = get_rudalle_model("Malevich", pretrained=True, fp16=True, device=device)
 realesrgan = get_realesrgan("x2", device=device)  # x2/x4/x8
@@ -31,7 +31,7 @@ top_k = 512
 top_p = 0.995
 
 
-samples_for_one = 16
+samples_for_one = 4
 
 
 def handle_requests_by_batch():
@@ -64,17 +64,14 @@ def make_images(text_input, num_images):
             bs=batch_size,
         )
         # CLIP
-        top_images = cherry_pick_by_ruclip(
+        top_images, clip_scores = cherry_pick_by_ruclip(
             pil_images, text, clip_predictor, count=num_images
         )
         # Super Resolution
         sr_images = super_resolution(top_images, realesrgan)
-
         response = []
 
-        for image in sr_images:
-            img = Image.fromarray(image)
-
+        for img in sr_images:
             buffered = BytesIO()
             img.save(buffered, format="JPEG")
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
